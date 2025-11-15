@@ -8,9 +8,9 @@ use crate::diagnostics::{BuildDiagnostics, Spanned};
 use crate::expression_tree::{
     BuiltinFunction, BuiltinMacroFunction, Callable, EasingCurve, Expression, MinMaxOp, Unit,
 };
-use crate::langtype::{EnumerationValue, Type};
+use crate::langtype::Type;
 use crate::parser::NodeOrToken;
-use smol_str::{format_smolstr, ToSmolStr};
+use smol_str::{ToSmolStr, format_smolstr};
 
 /// Used for uniquely name some variables
 static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -312,7 +312,9 @@ fn debug_macro(
     }
     Expression::FunctionCall {
         function: BuiltinFunction::Debug.into(),
-        arguments: vec![string.unwrap_or_else(|| Expression::default_value_for_type(&Type::String))],
+        arguments: vec![
+            string.unwrap_or_else(|| Expression::default_value_for_type(&Type::String)),
+        ],
         source_location: Some(node.to_source_location()),
     }
 }
@@ -417,34 +419,7 @@ fn to_debug_string(
                 ]),
             }
         }
-        Type::Enumeration(enu) => {
-            let local_object = "debug_enum";
-            let mut v = vec![Expression::StoreLocalVariable {
-                name: local_object.into(),
-                value: Box::new(expr),
-            }];
-            let mut cond =
-                Expression::StringLiteral(format_smolstr!("Error: invalid value for {}", ty));
-            for (idx, val) in enu.values.iter().enumerate() {
-                cond = Expression::Condition {
-                    condition: Box::new(Expression::BinaryExpression {
-                        lhs: Box::new(Expression::ReadLocalVariable {
-                            name: local_object.into(),
-                            ty: ty.clone(),
-                        }),
-                        rhs: Box::new(Expression::EnumerationValue(EnumerationValue {
-                            value: idx,
-                            enumeration: enu.clone(),
-                        })),
-                        op: '=',
-                    }),
-                    true_expr: Box::new(Expression::StringLiteral(val.clone())),
-                    false_expr: Box::new(cond),
-                };
-            }
-            v.push(cond);
-            Expression::CodeBlock(v)
-        }
+        Type::Enumeration(_) => Expression::Cast { from: Box::new(expr), to: (Type::String) },
     }
 }
 

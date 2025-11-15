@@ -14,11 +14,11 @@ use crate::expression_tree::{BindingExpression, BuiltinFunction, Expression};
 use crate::langtype::ElementType;
 use crate::layout::{LayoutItem, Orientation};
 use crate::namedreference::NamedReference;
-use crate::object_tree::{find_parent_element, Document, ElementRc, PropertyAnimation};
+use crate::object_tree::{Document, ElementRc, PropertyAnimation, find_parent_element};
 use derive_more as dm;
 
-use crate::expression_tree::Callable;
 use crate::CompilerConfiguration;
+use crate::expression_tree::Callable;
 use smol_str::{SmolStr, ToSmolStr};
 
 /// Represent the kind of property for the DefaultFontSize based on the `default-font-size`` property of every `Window``
@@ -47,6 +47,7 @@ impl DefaultFontSize {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GlobalAnalysis {
     pub default_font_size: DefaultFontSize,
+    pub const_scale_factor: Option<f32>,
 }
 
 /// Maps the alias in the other direction than what the BindingExpression::two_way_binding does.
@@ -60,6 +61,7 @@ pub fn binding_analysis(
     diag: &mut BuildDiagnostics,
 ) -> GlobalAnalysis {
     let mut global_analysis = GlobalAnalysis::default();
+    global_analysis.const_scale_factor = compiler_config.const_scale_factor;
     let mut reverse_aliases = Default::default();
     mark_used_base_properties(doc);
     propagate_is_set_on_aliases(doc, &mut reverse_aliases);

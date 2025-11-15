@@ -17,6 +17,7 @@ pub(super) struct NativeSliderData {
     pub pressed: u8,
     pub pressed_x: f32,
     pub pressed_val: f32,
+    pub pressed_max: f32,
 }
 
 type FloatArg = (f32,);
@@ -46,6 +47,7 @@ void initQSliderOptions(QStyleOptionSlider &option, bool pressed, bool enabled, 
     option.activeSubControls = { active_controls };
     if (vertical) {
         option.orientation = Qt::Vertical;
+        option.upsideDown = vertical;
     } else {
         option.orientation = Qt::Horizontal;
         option.state |= QStyle::State_Horizontal;
@@ -229,9 +231,10 @@ impl Item for NativeSlider {
                     if vertical { (pos.y, size.height) } else { (pos.x, size.width) };
                 if data.pressed != 0 {
                     // FIXME: use QStyle::subControlRect to find out the actual size of the groove
-                    let new_val = data.pressed_val
-                        + ((coord as f32) - data.pressed_x) * (self.maximum() - self.minimum())
-                            / size as f32;
+                    let delta = (coord as f32) - data.pressed_x;
+                    let delta = if vertical { -delta } else { delta };
+                    let new_val =
+                        data.pressed_val + delta * (self.maximum() - self.minimum()) / size as f32;
                     self.set_value(new_val);
                     InputEventResult::GrabMouse
                 } else {
@@ -277,7 +280,7 @@ impl Item for NativeSlider {
             let vertical = self.orientation() == Orientation::Vertical;
 
             if (!vertical && keycode == key_codes::RightArrow)
-                || (vertical && keycode == key_codes::DownArrow)
+                || (vertical && keycode == key_codes::UpArrow)
             {
                 if event.event_type == KeyEventType::KeyPressed {
                     self.set_value(self.value() + self.step());
@@ -287,7 +290,7 @@ impl Item for NativeSlider {
                 return KeyEventResult::EventAccepted;
             }
             if (!vertical && keycode == key_codes::LeftArrow)
-                || (vertical && keycode == key_codes::UpArrow)
+                || (vertical && keycode == key_codes::DownArrow)
             {
                 if event.event_type == KeyEventType::KeyPressed {
                     self.set_value(self.value() - self.step());

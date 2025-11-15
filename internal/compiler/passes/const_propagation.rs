@@ -8,7 +8,7 @@ use crate::expression_tree::*;
 use crate::langtype::ElementType;
 use crate::langtype::Type;
 use crate::object_tree::*;
-use smol_str::{format_smolstr, ToSmolStr};
+use smol_str::{ToSmolStr, format_smolstr};
 
 pub fn const_propagation(component: &Component, global_analysis: &GlobalAnalysis) {
     visit_all_expressions(component, |expr, ty| {
@@ -287,11 +287,7 @@ fn try_inline_function(
     }
     substitute_arguments_recursive(&mut body, arguments);
 
-    if simplify_expression(&mut body, ga) {
-        Some(body)
-    } else {
-        None
-    }
+    if simplify_expression(&mut body, ga) { Some(body) } else { None }
 }
 
 fn try_inline_builtin_function(
@@ -308,6 +304,9 @@ fn try_inline_builtin_function(
     let num = |n: f64| Some(Expression::NumberLiteral(n, Unit::None));
 
     match b {
+        BuiltinFunction::GetWindowScaleFactor => {
+            ga.const_scale_factor.map(|factor| Expression::NumberLiteral(factor as _, Unit::None))
+        }
         BuiltinFunction::GetWindowDefaultFontSize => match ga.default_font_size {
             crate::passes::binding_analysis::DefaultFontSize::LogicalValue(val) => {
                 Some(Expression::NumberLiteral(val as _, Unit::Px))
@@ -409,42 +408,53 @@ fn test_propagate_font_size() {
         Case {
             default_font_size: "default-font-size: 12px;",
             another_window: "",
-            check_expression: |e| assert_expr_is_mul(e, 5.0, 12.0)
+            check_expression: |e| assert_expr_is_mul(e, 5.0, 12.0),
         },
         Case {
             default_font_size: "default-font-size: some-value;",
             another_window: "",
-            check_expression: |e|  {
-                assert!(!e.is_constant(None), "{e:?} should not be constant since some-value can vary at runtime");
+            check_expression: |e| {
+                assert!(
+                    !e.is_constant(None),
+                    "{e:?} should not be constant since some-value can vary at runtime"
+                );
             },
         },
         Case {
             default_font_size: "default-font-size: 25px;",
             another_window: "export component AnotherWindow inherits Window { default-font-size: 8px; }",
-            check_expression: |e|  {
-                assert!(e.is_constant(None) && !matches!(e, Expression::NumberLiteral(_,_ )), "{e:?} should be constant but not known at compile time since there are two windows");
+            check_expression: |e| {
+                assert!(
+                    e.is_constant(None) && !matches!(e, Expression::NumberLiteral(_, _)),
+                    "{e:?} should be constant but not known at compile time since there are two windows"
+                );
             },
         },
         Case {
             default_font_size: "default-font-size: 25px;",
             another_window: "export component AnotherWindow inherits Window { }",
-            check_expression: |e|  {
-                assert!(!e.is_constant(None), "should not be const since at least one window has it unset");
+            check_expression: |e| {
+                assert!(
+                    !e.is_constant(None),
+                    "should not be const since at least one window has it unset"
+                );
             },
         },
         Case {
             default_font_size: "default-font-size: 20px;",
             another_window: "export component AnotherWindow inherits Window { default-font-size: 20px;  }",
-            check_expression: |e| assert_expr_is_mul(e, 5.0, 20.0)
+            check_expression: |e| assert_expr_is_mul(e, 5.0, 20.0),
         },
         Case {
             default_font_size: "default-font-size: 20px;",
             another_window: "export component AnotherWindow inherits Window { in property <float> f: 1; default-font-size: 20px*f;  }",
             check_expression: |e| {
-                assert!(!e.is_constant(None), "{e:?} should not be constant since 'f' can vary at runtime");
+                assert!(
+                    !e.is_constant(None),
+                    "{e:?} should not be constant since 'f' can vary at runtime"
+                );
             },
         },
-
     ] {
         let source = format!(
             r#"
@@ -483,4 +493,36 @@ export component Foo inherits Window {{
         let out1_binding = bindings.get("test").unwrap().borrow().expression.clone();
         check_expression(&out1_binding);
     }
+}
+
+#[test]
+fn test_const_scale_factor() {
+    let source = r#"
+export component Foo inherits Window {
+    out property <length> test: 10phx;
+}"#;
+
+    let mut test_diags = crate::diagnostics::BuildDiagnostics::default();
+    let doc_node = crate::parser::parse(
+        source.to_string(),
+        Some(std::path::Path::new("HELLO")),
+        &mut test_diags,
+    );
+    let mut compiler_config =
+        crate::CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter);
+    compiler_config.style = Some("fluent".into());
+    compiler_config.const_scale_factor = Some(2.);
+    let (doc, diag, _) =
+        spin_on::spin_on(crate::compile_syntax_node(doc_node, test_diags, compiler_config));
+    assert!(!diag.has_errors(), "slint compile error {:#?}", diag.to_string_vec());
+
+    let bindings = &doc.inner_components.last().unwrap().root_element.borrow().bindings;
+    let mut test_binding = bindings.get("test").unwrap().borrow().expression.clone();
+    if let Expression::Cast { from, to: _ } = test_binding {
+        test_binding = *from;
+    }
+    assert!(
+        matches!(test_binding, Expression::NumberLiteral(val, _) if val == 5.0),
+        "Expression should be 5.0: {test_binding:?}"
+    );
 }

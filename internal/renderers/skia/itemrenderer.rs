@@ -533,7 +533,7 @@ impl ItemRenderer for SkiaItemRenderer<'_> {
         size: LogicalSize,
         _cache: &CachedRenderingData,
     ) {
-        sharedparley::draw_text(self, text, Some(text.font_request(self_rc)), size);
+        sharedparley::draw_text(self, text, Some(self_rc), size);
     }
 
     fn draw_text_input(
@@ -542,13 +542,7 @@ impl ItemRenderer for SkiaItemRenderer<'_> {
         self_rc: &i_slint_core::items::ItemRc,
         size: LogicalSize,
     ) {
-        sharedparley::draw_text_input(
-            self,
-            text_input,
-            Some(text_input.font_request(self_rc)),
-            size,
-            None,
-        );
+        sharedparley::draw_text_input(self, text_input, self_rc, size, None);
     }
 
     fn draw_path(

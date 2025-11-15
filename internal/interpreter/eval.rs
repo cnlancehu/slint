@@ -223,6 +223,7 @@ pub fn eval_expression(expression: &Expression, local_context: &mut EvalLocalCon
                 }
                 (Value::Number(n), Type::Color) => Color::from_argb_encoded(n as u32).into(),
                 (Value::Brush(brush), Type::Color) => brush.color().into(),
+                (Value::EnumerationValue(_, val), Type::String) => Value::String(val.into()),
                 (v, _) => v,
             }
         }
@@ -392,12 +393,16 @@ pub fn eval_expression(expression: &Expression, local_context: &mut EvalLocalCon
                 GradientStop{ color, position }
             }))))
         }
-        Expression::ConicGradient{stops} => {
-            Value::Brush(Brush::ConicGradient(ConicGradientBrush::new(stops.iter().map(|(color, stop)| {
-                let color = eval_expression(color, local_context).try_into().unwrap();
-                let position = eval_expression(stop, local_context).try_into().unwrap();
-                GradientStop{ color, position }
-            }))))
+        Expression::ConicGradient{ from_angle, stops } => {
+            let from_angle: f32 = eval_expression(from_angle, local_context).try_into().unwrap();
+            Value::Brush(Brush::ConicGradient(ConicGradientBrush::new(
+                from_angle,
+                stops.iter().map(|(color, stop)| {
+                    let color = eval_expression(color, local_context).try_into().unwrap();
+                    let position = eval_expression(stop, local_context).try_into().unwrap();
+                    GradientStop{ color, position }
+                })
+            )))
         }
         Expression::EnumerationValue(value) => {
             Value::EnumerationValue(value.enumeration.name.to_string(), value.to_string())
@@ -1388,6 +1393,12 @@ fn call_builtin_function(
             } else {
                 panic!("internal error: argument to RestartTimer must be an element")
             }
+        }
+        BuiltinFunction::OpenUrl => {
+            let url: SharedString =
+                eval_expression(&arguments[0], local_context).try_into().unwrap();
+            corelib::open_url(&url);
+            Value::Void
         }
     }
 }

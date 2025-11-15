@@ -9,6 +9,7 @@ on:
   push:
     branches: [master, "feature/*"]
   workflow_dispatch:
+  merge_group:
 
 permissions:
   contents: read
@@ -23,8 +24,8 @@ env:
 
 jobs:
     format_fix:
-        runs-on: ubuntu-24.04
-        timeout-minutes: 15
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
         steps:
             - uses: actions/checkout@v5
             - uses: jdx/mise-action@v3
@@ -39,8 +40,8 @@ jobs:
               uses: autofix-ci/action@635ffb0c9798bd160680f18fd73371e355b85f27
 
     lint_typecheck:
-        runs-on: ubuntu-24.04
-        timeout-minutes: 15
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
         steps:
             - uses: actions/checkout@v5
             - uses: jdx/mise-action@v3

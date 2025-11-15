@@ -234,6 +234,7 @@ fn default_config() -> cbindgen::Config {
             // therefore it is ok to reinterpret_cast
             ("MenuEntryModel".into(), "std::shared_ptr<slint::Model<MenuEntry>>".into()),
             ("Coord".into(), "float".into()),
+            ("Channel".into(), "uint8_t".into()),
         ]
         .iter()
         .cloned()
@@ -397,6 +398,7 @@ fn gen_corelib(
         "MenuEntryModel",
         "MenuEntryArg",
         "Coord",
+        "Channel",
         "LogicalRect",
         "LogicalPoint",
         "LogicalPosition",
@@ -516,7 +518,8 @@ fn gen_corelib(
             "#include \"slint_sharedvector.h\"\n#include \"slint_point.h\"",
         ),
         (
-            vec!["Brush", "LinearGradient", "GradientStop", "RadialGradient"],
+            vec!["Brush", "LinearGradient", "GradientStop", "RadialGradient", "ConicGradientBrush",
+                 "slint_conic_gradient_normalize_stops", "slint_conic_gradient_apply_rotation"],
             "slint_brush_internal.h",
             "",
         ),
@@ -545,7 +548,7 @@ fn gen_corelib(
             "slint_windowrc_hide",
             "slint_windowrc_is_visible",
             "slint_windowrc_get_scale_factor",
-            "slint_windowrc_set_scale_factor",
+            "slint_windowrc_set_const_scale_factor",
             "slint_windowrc_get_text_input_focused",
             "slint_windowrc_set_text_input_focused",
             "slint_windowrc_set_focus_item",
@@ -576,6 +579,10 @@ fn gen_corelib(
             "slint_windowrc_is_minimized",
             "slint_windowrc_is_maximized",
             "slint_windowrc_take_snapshot",
+            "GradientStop",
+            "ConicGradientBrush",
+            "slint_conic_gradient_normalize_stops",
+            "slint_conic_gradient_apply_rotation",
         ]
         .into_iter()
         .chain(config.export.exclude.iter().map(|s| s.as_str()))

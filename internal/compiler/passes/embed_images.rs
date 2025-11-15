@@ -1,11 +1,11 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+use crate::EmbedResourcesKind;
 use crate::diagnostics::BuildDiagnostics;
 use crate::embedded_resources::*;
 use crate::expression_tree::{Expression, ImageReference};
 use crate::object_tree::*;
-use crate::EmbedResourcesKind;
 #[cfg(feature = "software-renderer")]
 use image::GenericImageView;
 use smol_str::SmolStr;
@@ -18,7 +18,7 @@ use std::rc::Rc;
 pub async fn embed_images(
     doc: &Document,
     embed_files: EmbedResourcesKind,
-    scale_factor: f64,
+    scale_factor: f32,
     resource_url_mapper: &Option<Rc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = Option<String>>>>>>,
     diag: &mut BuildDiagnostics,
 ) {
@@ -85,7 +85,7 @@ fn embed_images_from_expression(
     urls: &HashMap<SmolStr, Option<SmolStr>>,
     global_embedded_resources: &RefCell<BTreeMap<SmolStr, EmbeddedResources>>,
     embed_files: EmbedResourcesKind,
-    scale_factor: f64,
+    scale_factor: f32,
     diag: &mut BuildDiagnostics,
 ) {
     if let Expression::ImageReference { resource_ref, source_location, nine_slice: _ } = e {
@@ -129,7 +129,7 @@ fn embed_image(
     global_embedded_resources: &RefCell<BTreeMap<SmolStr, EmbeddedResources>>,
     embed_files: EmbedResourcesKind,
     path: &str,
-    _scale_factor: f64,
+    _scale_factor: f32,
     diag: &mut BuildDiagnostics,
     source_location: &Option<crate::diagnostics::SourceLocation>,
 ) -> ImageReference {
@@ -283,11 +283,7 @@ fn generate_texture(
                 }
                 ColorState::Rgb([a, b, c]) => {
                     let abs_diff = |t, u| {
-                        if t < u {
-                            u - t
-                        } else {
-                            t - u
-                        }
+                        if t < u { u - t } else { t - u }
                     };
                     let px = get_pixel();
                     if abs_diff(a, px[0]) > 2 || abs_diff(b, px[1]) > 2 || abs_diff(c, px[2]) > 2 {
@@ -365,7 +361,7 @@ enum SourceFormat {
 #[cfg(feature = "software-renderer")]
 fn load_image(
     file: crate::fileaccess::VirtualFile,
-    scale_factor: f64,
+    scale_factor: f32,
 ) -> image::ImageResult<(image::RgbaImage, SourceFormat, Size)> {
     use resvg::{tiny_skia, usvg};
     use std::ffi::OsStr;
@@ -428,8 +424,8 @@ fn load_image(
 
         if scale_factor < 1. {
             image = image.resize_exact(
-                (original_width as f64 * scale_factor) as u32,
-                (original_height as f64 * scale_factor) as u32,
+                (original_width as f32 * scale_factor) as u32,
+                (original_height as f32 * scale_factor) as u32,
                 image::imageops::FilterType::Gaussian,
             );
         }

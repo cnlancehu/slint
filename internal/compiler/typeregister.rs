@@ -3,7 +3,7 @@
 
 // cSpell: ignore imum
 
-use smol_str::{format_smolstr, SmolStr, StrExt, ToSmolStr};
+use smol_str::{SmolStr, StrExt, ToSmolStr, format_smolstr};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -207,6 +207,7 @@ pub fn reserved_accessibility_properties() -> impl Iterator<Item = (&'static str
         ("accessible-enabled", Type::Bool),
         ("accessible-expandable", Type::Bool),
         ("accessible-expanded", Type::Bool),
+        ("accessible-id", Type::String),
         ("accessible-label", Type::String),
         ("accessible-value", Type::String),
         ("accessible-value-maximum", Type::Float32),

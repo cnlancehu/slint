@@ -80,6 +80,9 @@ fn eval_expression(
                     slint::Color::from_argb_encoded(n as u32).into()
                 }
                 (Value::Brush(brush), langtype::Type::Color) => brush.color().into(),
+                (Value::EnumerationValue(_, val), langtype::Type::String) => {
+                    Value::String(val.into())
+                }
                 (v, _) => v,
             }
         }
@@ -241,15 +244,18 @@ fn eval_expression(
                 },
             )),
         )),
-        Expression::ConicGradient { stops } => Value::Brush(slint::Brush::ConicGradient(
-            i_slint_core::graphics::ConicGradientBrush::new(stops.iter().map(|(color, stop)| {
-                let color =
-                    eval_expression(color, local_context, None).try_into().unwrap_or_default();
-                let position =
-                    eval_expression(stop, local_context, None).try_into().unwrap_or_default();
-                i_slint_core::graphics::GradientStop { color, position }
-            })),
-        )),
+        Expression::ConicGradient { from_angle, stops } => Value::Brush(
+            slint::Brush::ConicGradient(i_slint_core::graphics::ConicGradientBrush::new(
+                eval_expression(from_angle, local_context, None).try_into().unwrap_or_default(),
+                stops.iter().map(|(color, stop)| {
+                    let color =
+                        eval_expression(color, local_context, None).try_into().unwrap_or_default();
+                    let position =
+                        eval_expression(stop, local_context, None).try_into().unwrap_or_default();
+                    i_slint_core::graphics::GradientStop { color, position }
+                }),
+            )),
+        ),
         Expression::EnumerationValue(value) => {
             Value::EnumerationValue(value.enumeration.name.to_string(), value.to_string())
         }

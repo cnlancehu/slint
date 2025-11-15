@@ -9,8 +9,7 @@ use i_slint_core::graphics::rendering_metrics_collector::{
     RenderingMetrics, RenderingMetricsCollector,
 };
 use i_slint_core::graphics::{
-    euclid, Brush, Color, FontRequest, IntRect, Point, Rgba8Pixel, SharedImageBuffer,
-    SharedPixelBuffer,
+    euclid, Brush, Color, IntRect, Point, Rgba8Pixel, SharedImageBuffer, SharedPixelBuffer,
 };
 use i_slint_core::input::{KeyEvent, KeyEventType, MouseEvent};
 use i_slint_core::item_rendering::{
@@ -684,7 +683,7 @@ impl ItemRenderer for QtItemRenderer<'_> {
         size: LogicalSize,
         _: &CachedRenderingData,
     ) {
-        sharedparley::draw_text(self, text, Some(text.font_request(self_rc)), size);
+        sharedparley::draw_text(self, text, Some(self_rc), size);
     }
 
     fn draw_text_input(
@@ -693,13 +692,7 @@ impl ItemRenderer for QtItemRenderer<'_> {
         self_rc: &ItemRc,
         size: LogicalSize,
     ) {
-        sharedparley::draw_text_input(
-            self,
-            text_input,
-            Some(text_input.font_request(self_rc)),
-            size,
-            Some(qt_password_character),
-        );
+        sharedparley::draw_text_input(self, text_input, self_rc, size, Some(qt_password_character));
     }
 
     fn draw_path(&mut self, path: Pin<&items::Path>, item_rc: &ItemRc, size: LogicalSize) {
@@ -2098,19 +2091,26 @@ impl WindowAdapterInternal for QtWindow {
 impl i_slint_core::renderer::RendererSealed for QtWindow {
     fn text_size(
         &self,
-        font_request: FontRequest,
-        text: &str,
+        text_item: Pin<&dyn i_slint_core::item_rendering::RenderString>,
+        item_rc: &ItemRc,
         max_width: Option<LogicalLength>,
-        scale_factor: ScaleFactor,
         text_wrap: TextWrap,
     ) -> LogicalSize {
-        sharedparley::text_size(font_request, text, max_width, scale_factor, text_wrap)
+        sharedparley::text_size(self, text_item, item_rc, max_width, text_wrap)
+    }
+
+    fn char_size(
+        &self,
+        text_item: Pin<&dyn i_slint_core::item_rendering::HasFont>,
+        item_rc: &i_slint_core::item_tree::ItemRc,
+        ch: char,
+    ) -> LogicalSize {
+        sharedparley::char_size(text_item, item_rc, ch).unwrap_or_default()
     }
 
     fn font_metrics(
         &self,
         font_request: i_slint_core::graphics::FontRequest,
-        _scale_factor: ScaleFactor,
     ) -> i_slint_core::items::FontMetrics {
         sharedparley::font_metrics(font_request)
     }
@@ -2118,31 +2118,19 @@ impl i_slint_core::renderer::RendererSealed for QtWindow {
     fn text_input_byte_offset_for_position(
         &self,
         text_input: Pin<&i_slint_core::items::TextInput>,
+        item_rc: &i_slint_core::item_tree::ItemRc,
         pos: LogicalPoint,
-        font_request: FontRequest,
-        scale_factor: ScaleFactor,
     ) -> usize {
-        sharedparley::text_input_byte_offset_for_position(
-            text_input,
-            pos,
-            font_request,
-            scale_factor,
-        )
+        sharedparley::text_input_byte_offset_for_position(self, text_input, item_rc, pos)
     }
 
     fn text_input_cursor_rect_for_byte_offset(
         &self,
         text_input: Pin<&i_slint_core::items::TextInput>,
+        item_rc: &i_slint_core::item_tree::ItemRc,
         byte_offset: usize,
-        font_request: FontRequest,
-        scale_factor: ScaleFactor,
     ) -> LogicalRect {
-        sharedparley::text_input_cursor_rect_for_byte_offset(
-            text_input,
-            byte_offset,
-            font_request,
-            scale_factor,
-        )
+        sharedparley::text_input_cursor_rect_for_byte_offset(self, text_input, item_rc, byte_offset)
     }
 
     fn register_font_from_memory(
@@ -2185,6 +2173,10 @@ impl i_slint_core::renderer::RendererSealed for QtWindow {
 
     fn set_window_adapter(&self, _window_adapter: &Rc<dyn WindowAdapter>) {
         // No-op because QtWindow is also the WindowAdapter
+    }
+
+    fn window_adapter(&self) -> Option<Rc<dyn WindowAdapter>> {
+        Some(WindowInner::from_pub(&self.window).window_adapter())
     }
 
     fn take_snapshot(&self) -> Result<SharedPixelBuffer<Rgba8Pixel>, PlatformError> {

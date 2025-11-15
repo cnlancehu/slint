@@ -11,14 +11,15 @@ use std::boxed::Box;
 use std::cell::RefCell;
 
 use crate::{
+    Color, SharedString,
     graphics::FontRequest,
     items::TextStrokeStyle,
     lengths::{
         LogicalBorderRadius, LogicalLength, LogicalPoint, LogicalRect, LogicalSize, PhysicalPx,
         PointLengths, ScaleFactor, SizeLengths,
     },
+    renderer::RendererSealed,
     textlayout::{TextHorizontalAlignment, TextOverflow, TextVerticalAlignment, TextWrap},
-    SharedString,
 };
 
 pub type PhysicalLength = euclid::Length<f32, PhysicalPx>;
@@ -42,7 +43,7 @@ pub trait GlyphRenderer: crate::item_rendering::ItemRenderer {
     ) -> Option<Self::PlatformBrush>;
 
     /// Returns a brush that's a solid fill of the specified color.
-    fn platform_brush_for_color(&mut self, color: &crate::Color) -> Option<Self::PlatformBrush>;
+    fn platform_brush_for_color(&mut self, color: &Color) -> Option<Self::PlatformBrush>;
 
     /// Returns the brush to be used for stroking text.
     fn platform_text_stroke_brush(
@@ -63,7 +64,7 @@ pub trait GlyphRenderer: crate::item_rendering::ItemRenderer {
         glyphs_it: &mut dyn Iterator<Item = parley::layout::Glyph>,
     );
 
-    fn fill_rectange_with_color(&mut self, physical_rect: PhysicalRect, color: crate::Color) {
+    fn fill_rectange_with_color(&mut self, physical_rect: PhysicalRect, color: Color) {
         if let Some(platform_brush) = self.platform_brush_for_color(&color) {
             self.fill_rectangle(physical_rect, platform_brush);
         }
@@ -99,10 +100,10 @@ std::thread_local! {
 
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 struct Brush {
-    /// When set, this overrides the fill/stroke to use this color for just a fill, for selection.
-    selection_fill_color: Option<crate::Color>,
+    /// When set, this overrides the fill/stroke to use this color.
+    override_fill_color: Option<Color>,
     stroke: Option<TextStrokeStyle>,
-    link_color: Option<crate::Color>,
+    link_color: Option<Color>,
 }
 
 struct LayoutOptions {
@@ -110,64 +111,57 @@ struct LayoutOptions {
     max_height: Option<LogicalLength>,
     horizontal_align: TextHorizontalAlignment,
     vertical_align: TextVerticalAlignment,
-    stroke: Option<TextStrokeStyle>,
-    font_request: Option<FontRequest>,
-    text_wrap: TextWrap,
     text_overflow: TextOverflow,
-    selection: Option<core::ops::Range<usize>>,
-    selection_foreground_color: Option<crate::Color>,
-    link_color: crate::Color,
 }
 
 impl LayoutOptions {
     fn new_from_textinput(
         text_input: Pin<&crate::items::TextInput>,
-        font_request: Option<FontRequest>,
         max_width: Option<LogicalLength>,
         max_height: Option<LogicalLength>,
-        selection: Option<core::ops::Range<usize>>,
     ) -> Self {
-        let selection_foreground_color =
-            selection.is_some().then(|| text_input.selection_foreground_color());
-
         Self {
             max_width,
             max_height,
             horizontal_align: text_input.horizontal_alignment(),
             vertical_align: text_input.vertical_alignment(),
-            font_request,
-            selection,
-            selection_foreground_color,
-            stroke: None,
-            text_wrap: text_input.wrap(),
             text_overflow: TextOverflow::Clip,
-            link_color: crate::Color::from_rgb_u8(64, 64, 255),
         }
     }
 }
 
-enum Text<'a> {
-    PlainText(&'a str),
-    #[cfg(feature = "experimental-rich-text")]
-    RichText(RichText<'a>),
+struct LayoutWithoutLineBreaksBuilder {
+    font_request: Option<FontRequest>,
+    text_wrap: TextWrap,
+    stroke: Option<TextStrokeStyle>,
+    scale_factor: ScaleFactor,
+    pixel_size: LogicalLength,
 }
 
-fn layout(text: Text, scale_factor: ScaleFactor, mut options: LayoutOptions) -> Layout {
-    // When a piece of text is first selected, it gets an empty range like `Some(1..1)`.
-    // If the text starts with a multi-byte character then this selection will be within
-    // that character and parley will panic. We just filter out empty selection ranges.
-    options.selection = options.selection.filter(|selection| !selection.is_empty());
+impl LayoutWithoutLineBreaksBuilder {
+    fn new(
+        font_request: Option<FontRequest>,
+        text_wrap: TextWrap,
+        stroke: Option<TextStrokeStyle>,
+        scale_factor: ScaleFactor,
+    ) -> Self {
+        let pixel_size = font_request
+            .as_ref()
+            .and_then(|font_request| font_request.pixel_size)
+            .unwrap_or(DEFAULT_FONT_SIZE);
 
-    let max_physical_width = options.max_width.map(|max_width| max_width * scale_factor);
-    let max_physical_height = options.max_height.map(|max_height| max_height * scale_factor);
-    let pixel_size = options
-        .font_request
-        .as_ref()
-        .and_then(|font_request| font_request.pixel_size)
-        .unwrap_or(DEFAULT_FONT_SIZE);
+        Self { font_request, text_wrap, stroke, scale_factor, pixel_size }
+    }
 
-    let push_to_builder = |builder: &mut parley::RangedBuilder<_>| {
-        if let Some(ref font_request) = options.font_request {
+    fn ranged_builder<'a>(
+        &self,
+        contexts: &'a mut Contexts,
+        text: &'a str,
+    ) -> parley::RangedBuilder<'a, Brush> {
+        let mut builder =
+            contexts.layout.ranged_builder(&mut contexts.font, text, self.scale_factor.get(), true);
+
+        if let Some(ref font_request) = self.font_request {
             let mut fallback_family_iter = sharedfontique::FALLBACK_FAMILIES
                 .into_iter()
                 .map(parley::style::FontFamily::Generic);
@@ -207,74 +201,45 @@ fn layout(text: Text, scale_factor: ScaleFactor, mut options: LayoutOptions) -> 
                 parley::style::FontStyle::Normal
             }));
         }
-        builder.push_default(parley::StyleProperty::FontSize(pixel_size.get()));
-        builder.push_default(parley::StyleProperty::WordBreak(match options.text_wrap {
+        builder.push_default(parley::StyleProperty::FontSize(self.pixel_size.get()));
+        builder.push_default(parley::StyleProperty::WordBreak(match self.text_wrap {
             TextWrap::NoWrap => parley::style::WordBreakStrength::KeepAll,
             TextWrap::WordWrap => parley::style::WordBreakStrength::Normal,
             TextWrap::CharWrap => parley::style::WordBreakStrength::BreakAll,
         }));
-        builder.push_default(parley::StyleProperty::OverflowWrap(match options.text_wrap {
+        builder.push_default(parley::StyleProperty::OverflowWrap(match self.text_wrap {
             TextWrap::NoWrap => parley::style::OverflowWrap::Normal,
             TextWrap::WordWrap | TextWrap::CharWrap => parley::style::OverflowWrap::Anywhere,
         }));
 
         builder.push_default(parley::StyleProperty::Brush(Brush {
-            selection_fill_color: None,
-            stroke: options.stroke,
+            override_fill_color: None,
+            stroke: self.stroke,
             link_color: None,
         }));
-    };
 
-    let (paragraphs, elision_info) = CONTEXTS.with_borrow_mut(move |contexts| {
-        let elision_info = if let (TextOverflow::Elide, Some(max_physical_width)) =
-            (options.text_overflow, max_physical_width)
-        {
-            let mut builder =
-                contexts.layout.ranged_builder(&mut contexts.font, "…", scale_factor.get(), true);
-            push_to_builder(&mut builder);
-            let mut layout = builder.build("…");
-            layout.break_all_lines(None);
-            let line = layout.lines().next().unwrap();
-            let item = line.items().next().unwrap();
-            let run = match item {
-                parley::layout::PositionedLayoutItem::GlyphRun(run) => Some(run),
-                _ => None,
-            }
-            .unwrap();
-            let glyph = run.positioned_glyphs().next().unwrap();
-            Some(ElisionInfo { elipsis_glyph: glyph, max_physical_width })
-        } else {
-            None
-        };
+        builder
+    }
 
-        let mut paragraphs = Vec::with_capacity(1);
-        let mut para_y = 0.0;
+    fn build(
+        &self,
+        text: &str,
+        selection: Option<(Range<usize>, Color)>,
+        formatting: impl IntoIterator<Item = FormattedSpan>,
+        link_color: Option<Color>,
+    ) -> parley::Layout<Brush> {
+        CONTEXTS.with_borrow_mut(|contexts| {
+            let mut builder = self.ranged_builder(contexts.as_mut(), text);
 
-        let mut paragraph_from_text = |text: &str,
-                                       range: std::ops::Range<usize>,
-                                       formatting: Vec<FormattedSpan>,
-                                       links: Vec<(
-            std::ops::Range<usize>,
-            std::string::String,
-        )>| {
-            let mut builder =
-                contexts.layout.ranged_builder(&mut contexts.font, text, scale_factor.get(), true);
-            push_to_builder(&mut builder);
-
-            if let Some((selection, selection_color)) =
-                options.selection.as_ref().zip(options.selection_foreground_color)
-            {
-                let sel_start = selection.start.max(range.start);
-                let sel_end = selection.end.min(range.end);
-                if sel_start < sel_end {
-                    let local_selection = (sel_start - range.start)..(sel_end - range.start);
+            if let Some((selection_range, selection_color)) = selection {
+                {
                     builder.push(
                         parley::StyleProperty::Brush(Brush {
-                            selection_fill_color: Some(selection_color),
-                            stroke: options.stroke,
+                            override_fill_color: Some(selection_color),
+                            stroke: self.stroke,
                             link_color: None,
                         }),
-                        local_selection,
+                        selection_range,
                     );
                 }
             }
@@ -313,9 +278,19 @@ fn layout(text: Text, scale_factor: ScaleFactor, mut options: LayoutOptions) -> 
                         builder.push(parley::StyleProperty::Underline(true), span.range.clone());
                         builder.push(
                             parley::StyleProperty::Brush(Brush {
-                                selection_fill_color: None,
-                                stroke: options.stroke,
-                                link_color: Some(options.link_color),
+                                override_fill_color: None,
+                                stroke: self.stroke,
+                                link_color: link_color.clone(),
+                            }),
+                            span.range,
+                        );
+                    }
+                    Style::Color(color) => {
+                        builder.push(
+                            parley::StyleProperty::Brush(Brush {
+                                override_fill_color: Some(color),
+                                stroke: self.stroke,
+                                link_color: None,
                             }),
                             span.range,
                         );
@@ -323,79 +298,147 @@ fn layout(text: Text, scale_factor: ScaleFactor, mut options: LayoutOptions) -> 
                 }
             }
 
-            let mut layout = builder.build(text);
+            builder.build(text)
+        })
+    }
+}
 
-            layout.break_all_lines(
-                max_physical_width
-                    .filter(|_| options.text_wrap != TextWrap::NoWrap)
-                    .map(|width| width.get()),
-            );
-            layout.align(
-                max_physical_width.map(|width| width.get()),
-                match options.horizontal_align {
-                    TextHorizontalAlignment::Left => parley::Alignment::Left,
-                    TextHorizontalAlignment::Center => parley::Alignment::Center,
-                    TextHorizontalAlignment::Right => parley::Alignment::Right,
-                },
-                parley::AlignmentOptions::default(),
-            );
+enum Text<'a> {
+    PlainText(&'a str),
+    #[cfg(feature = "experimental-rich-text")]
+    RichText(RichText<'a>),
+}
 
-            let y = PhysicalLength::new(para_y);
-            para_y += layout.height();
-            TextParagraph { range, y, layout, links }
+fn create_text_paragraphs(
+    layout_builder: &LayoutWithoutLineBreaksBuilder,
+    text: Text,
+    selection: Option<(Range<usize>, Color)>,
+    link_color: Color,
+) -> Vec<TextParagraph> {
+    let paragraph_from_text =
+        |text: &str,
+         range: std::ops::Range<usize>,
+         formatting: Vec<FormattedSpan>,
+         links: Vec<(std::ops::Range<usize>, std::string::String)>| {
+            let selection = selection.clone().and_then(|(selection, selection_color)| {
+                let sel_start = selection.start.max(range.start);
+                let sel_end = selection.end.min(range.end);
+
+                if sel_start < sel_end {
+                    let local_selection = (sel_start - range.start)..(sel_end - range.start);
+                    Some((local_selection, selection_color))
+                } else {
+                    None
+                }
+            });
+
+            let layout =
+                layout_builder.build(text, selection, formatting.into_iter(), Some(link_color));
+
+            TextParagraph { range, y: PhysicalLength::default(), layout, links }
         };
 
-        match text {
-            Text::PlainText(text) => {
-                let paragraph_ranges = core::iter::from_fn({
-                    let mut start = 0;
-                    let mut char_it = text.char_indices().peekable();
-                    let mut eot = false;
-                    move || {
-                        while let Some((idx, ch)) = char_it.next() {
-                            if ch == '\n' {
-                                let next_range = start..idx;
-                                start = idx + ch.len_utf8();
-                                return Some(next_range);
-                            }
-                        }
+    let mut paragraphs = Vec::with_capacity(1);
 
-                        if eot {
-                            return None;
+    match text {
+        Text::PlainText(text) => {
+            let paragraph_ranges = core::iter::from_fn({
+                let mut start = 0;
+                let mut char_it = text.char_indices().peekable();
+                let mut eot = false;
+                move || {
+                    while let Some((idx, ch)) = char_it.next() {
+                        if ch == '\n' {
+                            let next_range = start..idx;
+                            start = idx + ch.len_utf8();
+                            return Some(next_range);
                         }
-                        eot = true;
-                        return Some(start..text.len());
                     }
-                });
 
-                for range in paragraph_ranges {
-                    paragraphs.push(paragraph_from_text(
-                        &text[range.clone()],
-                        range,
-                        Default::default(),
-                        Default::default(),
-                    ));
+                    if eot {
+                        return None;
+                    }
+                    eot = true;
+                    return Some(start..text.len());
                 }
-            }
-            #[cfg(feature = "experimental-rich-text")]
-            Text::RichText(rich_text) => {
-                for paragraph in rich_text.paragraphs {
-                    paragraphs.push(paragraph_from_text(
-                        &paragraph.text,
-                        0..0,
-                        paragraph.formatting,
-                        paragraph
-                            .links
-                            .into_iter()
-                            .map(|(range, link)| (range, link.into_string()))
-                            .collect(),
-                    ));
-                }
-            }
-        };
+            });
 
-        (paragraphs, elision_info)
-    });
+            for range in paragraph_ranges {
+                paragraphs.push(paragraph_from_text(
+                    &text[range.clone()],
+                    range,
+                    Default::default(),
+                    Default::default(),
+                ));
+            }
+        }
+        #[cfg(feature = "experimental-rich-text")]
+        Text::RichText(rich_text) => {
+            for paragraph in rich_text.paragraphs {
+                paragraphs.push(paragraph_from_text(
+                    &paragraph.text,
+                    0..0,
+                    paragraph.formatting,
+                    paragraph
+                        .links
+                        .into_iter()
+                        .map(|(range, link)| (range, link.into_string()))
+                        .collect(),
+                ));
+            }
+        }
+    };
+
+    paragraphs
+}
+
+fn layout(
+    layout_builder: &LayoutWithoutLineBreaksBuilder,
+    mut paragraphs: Vec<TextParagraph>,
+    scale_factor: ScaleFactor,
+    options: LayoutOptions,
+) -> Layout {
+    let max_physical_width = options.max_width.map(|max_width| max_width * scale_factor);
+    let max_physical_height = options.max_height.map(|max_height| max_height * scale_factor);
+
+    let elision_info = if let (TextOverflow::Elide, Some(max_physical_width)) =
+        (options.text_overflow, max_physical_width)
+    {
+        let mut layout = layout_builder.build("…", None, None, None);
+        layout.break_all_lines(None);
+        let line = layout.lines().next().unwrap();
+        let item = line.items().next().unwrap();
+        let run = match item {
+            parley::layout::PositionedLayoutItem::GlyphRun(run) => Some(run),
+            _ => None,
+        }
+        .unwrap();
+        let glyph = run.positioned_glyphs().next().unwrap();
+        Some(ElisionInfo { elipsis_glyph: glyph, max_physical_width })
+    } else {
+        None
+    };
+
+    let mut para_y = 0.0;
+    for para in paragraphs.iter_mut() {
+        para.layout.break_all_lines(
+            max_physical_width
+                .filter(|_| layout_builder.text_wrap != TextWrap::NoWrap)
+                .map(|width| width.get()),
+        );
+        para.layout.align(
+            max_physical_width.map(|width| width.get()),
+            match options.horizontal_align {
+                TextHorizontalAlignment::Left => parley::Alignment::Left,
+                TextHorizontalAlignment::Center => parley::Alignment::Center,
+                TextHorizontalAlignment::Right => parley::Alignment::Right,
+            },
+            parley::AlignmentOptions::default(),
+        );
+
+        para.y = PhysicalLength::new(para_y);
+        para_y += para.layout.height();
+    }
 
     let max_width = paragraphs
         .iter()
@@ -490,7 +533,7 @@ impl TextParagraph {
                         };
 
                         let (fill_brush, stroke_style) =
-                            match (brush.selection_fill_color, brush.link_color) {
+                            match (brush.override_fill_color, brush.link_color) {
                                 (Some(color), _) => {
                                     let Some(selection_brush) =
                                         item_renderer.platform_brush_for_color(&color)
@@ -804,6 +847,7 @@ enum Style {
     Code,
     Link,
     Underline,
+    Color(Color),
 }
 
 #[derive(Debug, PartialEq)]
@@ -865,7 +909,32 @@ impl<'a> RichText<'a> {
 }
 
 #[cfg(feature = "experimental-rich-text")]
-fn parse_markdown(string: &str) -> RichText<'_> {
+#[derive(Debug, thiserror::Error)]
+enum RichTextError<'a> {
+    #[error("Spans are unbalanced: stack already empty when popped")]
+    Pop,
+    #[error("Spans are unbalanced: stack contained items at end of function")]
+    NotEmpty,
+    #[error("Paragraph not started")]
+    ParagraphNotStarted,
+    #[error("Unimplemented: {:?}", .0)]
+    UnimplementedTag(pulldown_cmark::Tag<'a>),
+    #[error("Unimplemented: {:?}", .0)]
+    UnimplementedEvent(pulldown_cmark::Event<'a>),
+    #[error("Unimplemented: {}", .0)]
+    UnimplementedHtmlEvent(std::string::String),
+    #[error("Unimplemented html tag: {}", .0)]
+    UnimplementedHtmlTag(std::string::String),
+    #[error("Unexpected {} attribute in html {}", .0, .1)]
+    UnexpectedAttribute(std::string::String, std::string::String),
+    #[error("Missing color attribute in html {}", .0)]
+    MissingColor(std::string::String),
+    #[error("Closing html tag doesn't match the opening tag. Expected {}, got {}", .0, .1)]
+    ClosingTagMismatch(&'a str, std::string::String),
+}
+
+#[cfg(feature = "experimental-rich-text")]
+fn parse_markdown(string: &str) -> Result<RichText<'_>, RichTextError<'_>> {
     let parser =
         pulldown_cmark::Parser::new_ext(string, pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
 
@@ -878,34 +947,40 @@ fn parse_markdown(string: &str) -> RichText<'_> {
         let indentation = list_state_stack.len().saturating_sub(1) as _;
 
         match event {
-            pulldown_cmark::Event::SoftBreak
-            | pulldown_cmark::Event::HardBreak
-            | pulldown_cmark::Event::Start(pulldown_cmark::Tag::Paragraph) => {
+            pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak => {
                 rich_text.begin_paragraph(indentation, None);
             }
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Item) => {
-                rich_text.begin_paragraph(
-                    indentation,
-                    Some(match list_state_stack.last().copied() {
-                        Some(Some(index)) => ListItemType::Ordered(index),
-                        _ => ListItemType::Unordered,
-                    }),
-                );
-                if let Some(state) = list_state_stack.last_mut() {
-                    *state = state.map(|state| state + 1);
-                }
-            }
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::List(index)) => {
-                list_state_stack.push(index);
-            }
             pulldown_cmark::Event::End(pulldown_cmark::TagEnd::List(_)) => {
-                list_state_stack.pop();
+                if list_state_stack.pop().is_none() {
+                    return Err(RichTextError::Pop);
+                }
             }
             pulldown_cmark::Event::End(
                 pulldown_cmark::TagEnd::Paragraph | pulldown_cmark::TagEnd::Item,
             ) => {}
             pulldown_cmark::Event::Start(tag) => {
                 let style = match tag {
+                    pulldown_cmark::Tag::Paragraph => {
+                        rich_text.begin_paragraph(indentation, None);
+                        continue;
+                    }
+                    pulldown_cmark::Tag::Item => {
+                        rich_text.begin_paragraph(
+                            indentation,
+                            Some(match list_state_stack.last().copied() {
+                                Some(Some(index)) => ListItemType::Ordered(index),
+                                _ => ListItemType::Unordered,
+                            }),
+                        );
+                        if let Some(state) = list_state_stack.last_mut() {
+                            *state = state.map(|state| state + 1);
+                        }
+                        continue;
+                    }
+                    pulldown_cmark::Tag::List(index) => {
+                        list_state_stack.push(index);
+                        continue;
+                    }
                     pulldown_cmark::Tag::Strong => Style::Strong,
                     pulldown_cmark::Tag::Emphasis => Style::Emphasis,
                     pulldown_cmark::Tag::Strikethrough => Style::Strikethrough,
@@ -913,9 +988,7 @@ fn parse_markdown(string: &str) -> RichText<'_> {
                         current_url = Some(dest_url);
                         Style::Link
                     }
-                    pulldown_cmark::Tag::Paragraph
-                    | pulldown_cmark::Tag::List(_)
-                    | pulldown_cmark::Tag::Item => unreachable!(),
+
                     pulldown_cmark::Tag::Heading { .. }
                     | pulldown_cmark::Tag::Image { .. }
                     | pulldown_cmark::Tag::DefinitionList
@@ -932,19 +1005,37 @@ fn parse_markdown(string: &str) -> RichText<'_> {
                     | pulldown_cmark::Tag::BlockQuote(_)
                     | pulldown_cmark::Tag::CodeBlock(_)
                     | pulldown_cmark::Tag::FootnoteDefinition(_) => {
-                        unimplemented!("{:?}", tag)
+                        return Err(RichTextError::UnimplementedTag(tag));
                     }
                 };
 
-                style_stack.push((style, rich_text.paragraphs.last().unwrap().text.len()));
+                style_stack.push((
+                    style,
+                    rich_text
+                        .paragraphs
+                        .last()
+                        .ok_or(RichTextError::ParagraphNotStarted)?
+                        .text
+                        .len(),
+                ));
             }
             pulldown_cmark::Event::Text(text) => {
-                rich_text.paragraphs.last_mut().unwrap().text.push_str(&text);
+                rich_text
+                    .paragraphs
+                    .last_mut()
+                    .ok_or(RichTextError::ParagraphNotStarted)?
+                    .text
+                    .push_str(&text);
             }
             pulldown_cmark::Event::End(_) => {
-                let (style, start) = style_stack.pop().unwrap();
+                let (style, start) = if let Some(value) = style_stack.pop() {
+                    value
+                } else {
+                    return Err(RichTextError::Pop);
+                };
 
-                let paragraph = rich_text.paragraphs.last_mut().unwrap();
+                let paragraph =
+                    rich_text.paragraphs.last_mut().ok_or(RichTextError::ParagraphNotStarted)?;
                 let end = paragraph.text.len();
 
                 if let Some(url) = current_url.take() {
@@ -954,44 +1045,150 @@ fn parse_markdown(string: &str) -> RichText<'_> {
                 paragraph.formatting.push(FormattedSpan { range: start..end, style });
             }
             pulldown_cmark::Event::Code(text) => {
-                let paragraph = rich_text.paragraphs.last_mut().unwrap();
+                let paragraph =
+                    rich_text.paragraphs.last_mut().ok_or(RichTextError::ParagraphNotStarted)?;
                 let start = paragraph.text.len();
                 paragraph.text.push_str(&text);
                 paragraph
                     .formatting
                     .push(FormattedSpan { range: start..paragraph.text.len(), style: Style::Code });
             }
-            pulldown_cmark::Event::InlineHtml(html) => match &*html {
-                "<u>" => {
-                    style_stack
-                        .push((Style::Underline, rich_text.paragraphs.last().unwrap().text.len()));
-                }
-                "</u>" => {
-                    let (style, start) = style_stack.pop().unwrap();
+            pulldown_cmark::Event::InlineHtml(html) => {
+                if html.starts_with("</") {
+                    let (style, start) = if let Some(value) = style_stack.pop() {
+                        value
+                    } else {
+                        return Err(RichTextError::Pop);
+                    };
 
-                    let paragraph = rich_text.paragraphs.last_mut().unwrap();
+                    let expected_tag = match &style {
+                        Style::Color(_) => "</font>",
+                        Style::Underline => "</u>",
+                        other => std::unreachable!(
+                            "Got unexpected closing style {:?} with html {}. This error should have been caught earlier.",
+                            other,
+                            html
+                        ),
+                    };
+
+                    if (&*html) != expected_tag {
+                        return Err(RichTextError::ClosingTagMismatch(
+                            expected_tag,
+                            (&*html).into(),
+                        ));
+                    }
+
+                    let paragraph = rich_text
+                        .paragraphs
+                        .last_mut()
+                        .ok_or(RichTextError::ParagraphNotStarted)?;
                     let end = paragraph.text.len();
                     paragraph.formatting.push(FormattedSpan { range: start..end, style });
+                } else {
+                    let mut expecting_color_attribute = false;
+
+                    for token in htmlparser::Tokenizer::from(&*html) {
+                        match token {
+                            Ok(htmlparser::Token::ElementStart { local: tag_type, .. }) => {
+                                match &*tag_type {
+                                    "u" => {
+                                        style_stack.push((
+                                            Style::Underline,
+                                            rich_text
+                                                .paragraphs
+                                                .last()
+                                                .ok_or(RichTextError::ParagraphNotStarted)?
+                                                .text
+                                                .len(),
+                                        ));
+                                    }
+                                    "font" => {
+                                        expecting_color_attribute = true;
+                                    }
+                                    _ => {
+                                        return Err(RichTextError::UnimplementedHtmlTag(
+                                            (&*tag_type).into(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(htmlparser::Token::Attribute {
+                                local: key,
+                                value: Some(value),
+                                ..
+                            }) => match &*key {
+                                "color" => {
+                                    if !expecting_color_attribute {
+                                        return Err(RichTextError::UnexpectedAttribute(
+                                            (&*key).into(),
+                                            (&*html).into(),
+                                        ));
+                                    }
+                                    expecting_color_attribute = false;
+
+                                    let value =
+                                        i_slint_common::color_parsing::parse_color_literal(&*value)
+                                            .or_else(|| {
+                                                i_slint_common::color_parsing::named_colors()
+                                                    .get(&*value)
+                                                    .copied()
+                                            })
+                                            .expect("invalid color value");
+
+                                    style_stack.push((
+                                        Style::Color(Color::from_argb_encoded(value)),
+                                        rich_text
+                                            .paragraphs
+                                            .last()
+                                            .ok_or(RichTextError::ParagraphNotStarted)?
+                                            .text
+                                            .len(),
+                                    ));
+                                }
+                                _ => {
+                                    return Err(RichTextError::UnexpectedAttribute(
+                                        (&*key).into(),
+                                        (&*html).into(),
+                                    ));
+                                }
+                            },
+                            Ok(htmlparser::Token::ElementEnd { .. }) => {}
+                            _ => {
+                                return Err(RichTextError::UnimplementedHtmlEvent(std::format!(
+                                    "{:?}", token
+                                )));
+                            }
+                        }
+                    }
+
+                    if expecting_color_attribute {
+                        return Err(RichTextError::MissingColor((&*html).into()));
+                    }
                 }
-                other => unimplemented!("{}", other),
-            },
+            }
             pulldown_cmark::Event::Rule
             | pulldown_cmark::Event::TaskListMarker(_)
             | pulldown_cmark::Event::FootnoteReference(_)
             | pulldown_cmark::Event::InlineMath(_)
             | pulldown_cmark::Event::DisplayMath(_)
-            | pulldown_cmark::Event::Html(_) => unimplemented!("{:?}", event),
+            | pulldown_cmark::Event::Html(_) => {
+                return Err(RichTextError::UnimplementedEvent(event));
+            }
         }
     }
 
-    rich_text
+    if !style_stack.is_empty() {
+        return Err(RichTextError::NotEmpty);
+    }
+
+    Ok(rich_text)
 }
 
 #[cfg(feature = "experimental-rich-text")]
 #[test]
 fn markdown_parsing() {
     assert_eq!(
-        parse_markdown("hello *world*").paragraphs,
+        parse_markdown("hello *world*").unwrap().paragraphs,
         [RichTextParagraph {
             text: "hello world".into(),
             formatting: std::vec![FormattedSpan { range: 6..11, style: Style::Emphasis }],
@@ -1006,6 +1203,7 @@ fn markdown_parsing() {
 - line 2
             "
         )
+        .unwrap()
         .paragraphs,
         [
             RichTextParagraph {
@@ -1029,6 +1227,7 @@ fn markdown_parsing() {
 4. c
         "
         )
+        .unwrap()
         .paragraphs,
         [
             RichTextParagraph { text: "1. a".into(), formatting: std::vec![], links: std::vec![] },
@@ -1044,6 +1243,7 @@ Normal _italic_ **strong** ~~strikethrough~~ `code`
 new *line*
 "
         )
+        .unwrap()
         .paragraphs,
         [
             RichTextParagraph {
@@ -1073,6 +1273,7 @@ new *line*
       - great grandchild
 "
         )
+        .unwrap()
         .paragraphs,
         [
             RichTextParagraph {
@@ -1099,7 +1300,7 @@ new *line*
     );
 
     assert_eq!(
-        parse_markdown("hello [*world*](https://example.com)").paragraphs,
+        parse_markdown("hello [*world*](https://example.com)").unwrap().paragraphs,
         [RichTextParagraph {
             text: "hello world".into(),
             formatting: std::vec![
@@ -1111,10 +1312,34 @@ new *line*
     );
 
     assert_eq!(
-        parse_markdown("<u>hello world</u>").paragraphs,
+        parse_markdown("<u>hello world</u>").unwrap().paragraphs,
         [RichTextParagraph {
             text: "hello world".into(),
             formatting: std::vec![FormattedSpan { range: 0..11, style: Style::Underline },],
+            links: std::vec![]
+        }]
+    );
+
+    assert_eq!(
+        parse_markdown(r#"<font color="blue">hello world</font>"#).unwrap().paragraphs,
+        [RichTextParagraph {
+            text: "hello world".into(),
+            formatting: std::vec![FormattedSpan {
+                range: 0..11,
+                style: Style::Color(Color::from_rgb_u8(0, 0, 255))
+            },],
+            links: std::vec![]
+        }]
+    );
+
+    assert_eq!(
+        parse_markdown(r#"<u><font color="red">hello world</font></u>"#).unwrap().paragraphs,
+        [RichTextParagraph {
+            text: "hello world".into(),
+            formatting: std::vec![
+                FormattedSpan { range: 0..11, style: Style::Color(Color::from_rgb_u8(255, 0, 0)) },
+                FormattedSpan { range: 0..11, style: Style::Underline },
+            ],
             links: std::vec![]
         }]
     );
@@ -1123,21 +1348,9 @@ new *line*
 pub fn draw_text(
     item_renderer: &mut impl GlyphRenderer,
     text: Pin<&dyn crate::item_rendering::RenderText>,
-    font_request: Option<FontRequest>,
+    item_rc: Option<&crate::item_tree::ItemRc>,
     size: LogicalSize,
 ) {
-    let str = text.text();
-
-    #[cfg(feature = "experimental-rich-text")]
-    let layout_text = if text.is_markdown() {
-        Text::RichText(parse_markdown(&str))
-    } else {
-        Text::PlainText(&str)
-    };
-
-    #[cfg(not(feature = "experimental-rich-text"))]
-    let layout_text = Text::PlainText(&str);
-
     let max_width = size.width_length();
     let max_height = size.height_length();
 
@@ -1154,41 +1367,63 @@ pub fn draw_text(
     let scale_factor = ScaleFactor::new(item_renderer.scale_factor());
 
     let (stroke_brush, stroke_width, stroke_style) = text.stroke();
-    let stroke_width = if stroke_width.get() != 0.0 {
-        (stroke_width * scale_factor).get()
-    } else {
-        // Hairline stroke
-        1.0
-    };
-    let stroke_width = match stroke_style {
-        TextStrokeStyle::Outside => stroke_width * 2.0,
-        TextStrokeStyle::Center => stroke_width,
-    };
     let platform_stroke_brush = if !stroke_brush.is_transparent() {
+        let stroke_width = if stroke_width.get() != 0.0 {
+            (stroke_width * scale_factor).get()
+        } else {
+            // Hairline stroke
+            1.0
+        };
+        let stroke_width = match stroke_style {
+            TextStrokeStyle::Outside => stroke_width * 2.0,
+            TextStrokeStyle::Center => stroke_width,
+        };
         item_renderer.platform_text_stroke_brush(stroke_brush, stroke_width, size)
     } else {
         None
     };
 
-    let (horizontal_align, vertical_align) = text.alignment();
+    let layout_builder = LayoutWithoutLineBreaksBuilder::new(
+        item_rc.map(|item_rc| text.font_request(item_rc)),
+        text.wrap(),
+        platform_stroke_brush.is_some().then_some(stroke_style),
+        scale_factor,
+    );
 
+    let str = text.text();
+
+    #[cfg(feature = "experimental-rich-text")]
+    let layout_text = if text.is_markdown() {
+        Text::RichText(match parse_markdown(&str) {
+            Ok(rich_text) => rich_text,
+            Err(error) => {
+                crate::debug_log!("{}", error);
+                return;
+            }
+        })
+    } else {
+        Text::PlainText(&str)
+    };
+
+    #[cfg(not(feature = "experimental-rich-text"))]
+    let layout_text = Text::PlainText(&str);
+
+    let paragraphs_without_linebreaks =
+        create_text_paragraphs(&layout_builder, layout_text, None, text.link_color());
+
+    let (horizontal_align, vertical_align) = text.alignment();
     let text_overflow = text.overflow();
 
     let layout = layout(
-        layout_text,
+        &layout_builder,
+        paragraphs_without_linebreaks,
         scale_factor,
         LayoutOptions {
             horizontal_align,
             vertical_align,
             max_height: Some(max_height),
             max_width: Some(max_width),
-            stroke: platform_stroke_brush.is_some().then_some(stroke_style),
-            font_request,
-            text_wrap: text.wrap(),
-            text_overflow,
-            selection: None,
-            selection_foreground_color: None,
-            link_color: crate::Color::from_rgb_u8(64, 64, 255),
+            text_overflow: text.overflow(),
         },
     );
 
@@ -1224,31 +1459,41 @@ pub fn draw_text(
 pub fn link_under_cursor(
     scale_factor: ScaleFactor,
     text: Pin<&dyn crate::item_rendering::RenderText>,
-    font_request: Option<FontRequest>,
+    item_rc: &crate::item_tree::ItemRc,
     size: LogicalSize,
     cursor: PhysicalPoint,
 ) -> Option<std::string::String> {
-    let str = text.text();
+    let layout_builder = LayoutWithoutLineBreaksBuilder::new(
+        Some(text.font_request(item_rc)),
+        text.wrap(),
+        None,
+        scale_factor,
+    );
 
-    let layout_text = Text::RichText(parse_markdown(&str));
+    let str = text.text();
+    let layout_text = Text::RichText(match parse_markdown(&str) {
+        Ok(rich_text) => rich_text,
+        Err(error) => {
+            crate::debug_log!("{}", error);
+            return None;
+        }
+    });
+
+    let paragraphs_without_linebreaks =
+        create_text_paragraphs(&layout_builder, layout_text, None, text.link_color());
 
     let (horizontal_align, vertical_align) = text.alignment();
 
     let layout = layout(
-        layout_text,
+        &layout_builder,
+        paragraphs_without_linebreaks,
         scale_factor,
         LayoutOptions {
             horizontal_align,
             vertical_align,
             max_height: Some(size.height_length()),
             max_width: Some(size.width_length()),
-            stroke: None,
-            font_request,
-            text_wrap: text.wrap(),
             text_overflow: text.overflow(),
-            selection: None,
-            selection_foreground_color: None,
-            link_color: crate::Color::from_rgb_u8(64, 64, 255),
         },
     );
 
@@ -1283,7 +1528,7 @@ pub fn link_under_cursor(
 pub fn draw_text_input(
     item_renderer: &mut impl GlyphRenderer,
     text_input: Pin<&crate::items::TextInput>,
-    font_request: Option<FontRequest>,
+    item_rc: &crate::item_tree::ItemRc,
     size: LogicalSize,
     password_character: Option<fn() -> char>,
 ) {
@@ -1301,81 +1546,157 @@ pub fn draw_text_input(
         return;
     };
 
-    let (min_select, max_select) = if !visual_representation.preedit_range.is_empty() {
-        (visual_representation.preedit_range.start, visual_representation.preedit_range.end)
+    let selection_range = if !visual_representation.preedit_range.is_empty() {
+        visual_representation.preedit_range.start..visual_representation.preedit_range.end
     } else {
-        (visual_representation.selection_range.start, visual_representation.selection_range.end)
+        visual_representation.selection_range.start..visual_representation.selection_range.end
     };
-
-    let (cursor_visible, cursor_pos) =
-        if let Some(cursor_pos) = visual_representation.cursor_position {
-            (true, cursor_pos)
-        } else {
-            (false, 0)
-        };
 
     let scale_factor = ScaleFactor::new(item_renderer.scale_factor());
 
-    let text: SharedString = visual_representation.text.into();
-
-    let layout = layout(
-        Text::PlainText(&text),
+    let layout_builder = LayoutWithoutLineBreaksBuilder::new(
+        Some(text_input.font_request(item_rc)),
+        text_input.wrap(),
+        None,
         scale_factor,
-        LayoutOptions::new_from_textinput(
-            text_input,
-            font_request,
-            Some(width),
-            Some(height),
-            Some(min_select..max_select),
-        ),
     );
 
-    layout.selection_geometry(min_select..max_select, |selection_rect| {
+    let text: SharedString = visual_representation.text.into();
+
+    // When a piece of text is first selected, it gets an empty range like `Some(1..1)`.
+    // If the text starts with a multi-byte character then this selection will be within
+    // that character and parley will panic. We just filter out empty selection ranges.
+    let selection_and_color = if !selection_range.is_empty() {
+        Some((selection_range.clone(), text_input.selection_foreground_color()))
+    } else {
+        None
+    };
+
+    let paragraphs_without_linebreaks = create_text_paragraphs(
+        &layout_builder,
+        Text::PlainText(&text),
+        selection_and_color,
+        Color::default(),
+    );
+
+    let layout = layout(
+        &layout_builder,
+        paragraphs_without_linebreaks,
+        scale_factor,
+        LayoutOptions::new_from_textinput(text_input, Some(width), Some(height)),
+    );
+
+    layout.selection_geometry(selection_range, |selection_rect| {
         item_renderer
             .fill_rectange_with_color(selection_rect, text_input.selection_background_color());
     });
 
-    layout.draw(
-        item_renderer,
-        platform_fill_brush,
-        None,
-        &mut |item_renderer, font, font_size, brush, y_offset, glyphs_it| {
-            item_renderer.draw_glyph_run(font, font_size, brush, y_offset, glyphs_it);
-        },
+    item_renderer.save_state();
+
+    let render = item_renderer.combine_clip(
+        LogicalRect::new(LogicalPoint::default(), size),
+        LogicalBorderRadius::zero(),
+        LogicalLength::zero(),
     );
 
-    if cursor_visible {
-        let cursor_rect = layout
-            .cursor_rect_for_byte_offset(cursor_pos, text_input.text_cursor_width() * scale_factor);
-        item_renderer.fill_rectange_with_color(cursor_rect, visual_representation.cursor_color);
+    if render {
+        layout.draw(
+            item_renderer,
+            platform_fill_brush,
+            None,
+            &mut |item_renderer, font, font_size, brush, y_offset, glyphs_it| {
+                item_renderer.draw_glyph_run(font, font_size, brush, y_offset, glyphs_it);
+            },
+        );
+
+        if let Some(cursor_pos) = visual_representation.cursor_position {
+            let cursor_rect = layout.cursor_rect_for_byte_offset(
+                cursor_pos,
+                text_input.text_cursor_width() * scale_factor,
+            );
+            item_renderer.fill_rectange_with_color(cursor_rect, visual_representation.cursor_color);
+        }
     }
+
+    item_renderer.restore_state();
 }
 
 pub fn text_size(
-    font_request: FontRequest,
-    text: &str,
+    renderer: &dyn RendererSealed,
+    text_item: Pin<&dyn crate::item_rendering::RenderString>,
+    item_rc: &crate::item_tree::ItemRc,
     max_width: Option<LogicalLength>,
-    scale_factor: ScaleFactor,
     text_wrap: TextWrap,
 ) -> LogicalSize {
+    let Some(scale_factor) = renderer.scale_factor() else {
+        return LogicalSize::default();
+    };
+
+    let layout_builder = LayoutWithoutLineBreaksBuilder::new(
+        Some(text_item.font_request(item_rc)),
+        text_wrap,
+        None,
+        scale_factor,
+    );
+
+    let text = text_item.text();
+
+    let paragraphs_without_linebreaks = create_text_paragraphs(
+        &layout_builder,
+        Text::PlainText(text.as_str()),
+        None,
+        Color::default(),
+    );
+
     let layout = layout(
-        Text::PlainText(text),
+        &layout_builder,
+        paragraphs_without_linebreaks,
         scale_factor,
         LayoutOptions {
             max_width,
-            text_wrap,
-            font_request: Some(font_request),
             max_height: None,
             horizontal_align: TextHorizontalAlignment::Left,
             vertical_align: TextVerticalAlignment::Top,
-            stroke: None,
             text_overflow: TextOverflow::Clip,
-            selection: None,
-            selection_foreground_color: None,
-            link_color: crate::Color::from_rgb_u8(64, 64, 255),
         },
     );
     PhysicalSize::from_lengths(layout.max_width, layout.height) / scale_factor
+}
+
+pub fn char_size(
+    text_item: Pin<&dyn crate::item_rendering::HasFont>,
+    item_rc: &crate::item_tree::ItemRc,
+    ch: char,
+) -> Option<LogicalSize> {
+    let font_request = text_item.font_request(item_rc);
+    let font = font_request.query_fontique()?;
+
+    let char_map = font.charmap()?;
+
+    let face = skrifa::FontRef::from_index(font.blob.data(), font.index).unwrap();
+
+    let glyph_index = char_map.map(ch)?;
+
+    let pixel_size = font_request.pixel_size.unwrap_or(DEFAULT_FONT_SIZE);
+
+    let glyph_metrics = skrifa::metrics::GlyphMetrics::new(
+        &face,
+        skrifa::instance::Size::new(pixel_size.get()),
+        skrifa::instance::LocationRef::new(&[]),
+    );
+
+    let advance_width = LogicalLength::new(glyph_metrics.advance_width(glyph_index.into())?);
+
+    let font_metrics = skrifa::metrics::Metrics::new(
+        &face,
+        skrifa::instance::Size::new(pixel_size.get()),
+        skrifa::instance::LocationRef::new(&[]),
+    );
+
+    Some(LogicalSize::from_lengths(
+        advance_width,
+        LogicalLength::new(font_metrics.ascent - font_metrics.descent),
+    ))
 }
 
 pub fn font_metrics(font_request: FontRequest) -> crate::items::FontMetrics {
@@ -1397,13 +1718,15 @@ pub fn font_metrics(font_request: FontRequest) -> crate::items::FontMetrics {
 }
 
 pub fn text_input_byte_offset_for_position(
+    renderer: &dyn RendererSealed,
     text_input: Pin<&crate::items::TextInput>,
+    item_rc: &crate::item_tree::ItemRc,
     pos: LogicalPoint,
-    font_request: FontRequest,
-    scale_factor: ScaleFactor,
 ) -> usize {
+    let Some(scale_factor) = renderer.scale_factor() else {
+        return 0;
+    };
     let pos: PhysicalPoint = pos * scale_factor;
-    let text = text_input.text();
 
     let width = text_input.width();
     let height = text_input.height();
@@ -1411,16 +1734,22 @@ pub fn text_input_byte_offset_for_position(
         return 0;
     }
 
-    let layout = layout(
-        Text::PlainText(&text),
+    let layout_builder = LayoutWithoutLineBreaksBuilder::new(
+        Some(text_input.font_request(item_rc)),
+        text_input.wrap(),
+        None,
         scale_factor,
-        LayoutOptions::new_from_textinput(
-            text_input,
-            Some(font_request),
-            Some(width),
-            Some(height),
-            None,
-        ),
+    );
+
+    let text = text_input.text();
+    let paragraphs_without_linebreaks =
+        create_text_paragraphs(&layout_builder, Text::PlainText(&text), None, Color::default());
+
+    let layout = layout(
+        &layout_builder,
+        paragraphs_without_linebreaks,
+        scale_factor,
+        LayoutOptions::new_from_textinput(text_input, Some(width), Some(height)),
     );
     let byte_offset = layout.byte_offset_from_point(pos);
     let visual_representation = text_input.visual_representation(None);
@@ -1428,34 +1757,40 @@ pub fn text_input_byte_offset_for_position(
 }
 
 pub fn text_input_cursor_rect_for_byte_offset(
+    renderer: &dyn RendererSealed,
     text_input: Pin<&crate::items::TextInput>,
+    item_rc: &crate::item_tree::ItemRc,
     byte_offset: usize,
-    font_request: FontRequest,
-    scale_factor: ScaleFactor,
 ) -> LogicalRect {
-    let text = text_input.text();
+    let Some(scale_factor) = renderer.scale_factor() else {
+        return LogicalRect::default();
+    };
 
-    let font_size = font_request.pixel_size.unwrap_or(DEFAULT_FONT_SIZE);
+    let layout_builder = LayoutWithoutLineBreaksBuilder::new(
+        Some(text_input.font_request(item_rc)),
+        text_input.wrap(),
+        None,
+        scale_factor,
+    );
 
     let width = text_input.width();
     let height = text_input.height();
     if width.get() <= 0. || height.get() <= 0. {
         return LogicalRect::new(
             LogicalPoint::default(),
-            LogicalSize::from_lengths(LogicalLength::new(1.0), font_size),
+            LogicalSize::from_lengths(LogicalLength::new(1.0), layout_builder.pixel_size),
         );
     }
 
+    let text = text_input.text();
+    let paragraphs_without_linebreaks =
+        create_text_paragraphs(&layout_builder, Text::PlainText(&text), None, Color::default());
+
     let layout = layout(
-        Text::PlainText(&text),
+        &layout_builder,
+        paragraphs_without_linebreaks,
         scale_factor,
-        LayoutOptions::new_from_textinput(
-            text_input,
-            Some(font_request),
-            Some(width),
-            Some(height),
-            None,
-        ),
+        LayoutOptions::new_from_textinput(text_input, Some(width), Some(height)),
     );
     let cursor_rect = layout
         .cursor_rect_for_byte_offset(byte_offset, text_input.text_cursor_width() * scale_factor);
